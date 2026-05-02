@@ -1,77 +1,125 @@
-export class AudioProcessorManager {
+export interface AudioProcessorConfig {
+    bufferSize: number;
+    maxChannels: number;
+    latencyHint: 'interactive' | 'balanced' | 'Playback';
+    noiseThreshold: number;
+    gain: number;
+}
+
+export class LowLatencyAudioProcessorManager {
     private worker: Worker | null = null;
     private initialized: boolean = false;
-    private pendingRequests: Map<number, (data: Float32Array) => void> = new Map();
-    private requestId: number = 0;
-    private onError: ((error: string) => void) | null = null;
-    private onInitialized: (() => void) | null = null;
+    private config: AudioProcessorConfig;
+    private onLatencyUpdate: ((latency: number) => void) | null = null;
 
-    constructor() {
-        // 创建Worker - 在实际项目中需要正确配置
-        // 这里使用动态创建方式，实际使用时需要配合构建工具
+    constructor(config?: Partial<AudioProcessorConfig>) {
+        this.config = {
+            bufferSize: config?.bufferSize || 128,
+            maxChannels: config?.maxChannels || 8,
+            latencyHint: config?.latencyHint || 'interactive',
+            noiseThreshold: config?.noiseThreshold || 0.05,
+            gain: config?.gain || 1.5
+        };
     }
 
-    async init(maxChannels: number = 8): Promise<void> {
+    async init(): Promise<void> {
         if (this.initialized) return;
 
-        // 注意：在实际项目中，需要使用正确的Worker导入方式
-        // 对于Create React App，可能需要使用worker-loader或自定义配置
-        // 这里提供一个简单的实现
-        
-        // 简单的内联Worker（实际项目中推荐使用分离的文件）
         const workerCode = `
-            // 简化版Worker，实际项目应使用完整的audioProcessor.worker.ts
+            const BUFFER_SIZE = ${this.config.bufferSize};
+            const MAX_CHANNELS = ${this.config.maxChannels};
+            
             let processing = false;
+            let channels = new Map();
+            let noiseThreshold = ${this.config.noiseThreshold};
+            let gain = ${this.config.gain};
             
             self.onmessage = (e) => {
                 const msg = e.data;
                 
                 switch(msg.type) {
                     case 'init':
-                        self.postMessage({ type: 'initialized' });
+                        self.postMessage({ type: 'initialized', bufferSize: BUFFER_SIZE });
                         break;
                         
                     case 'setChannelData':
-                        // 存储通道数据
-                        self.channels = self.channels || {};
-                        self.channels[msg.channelId] = msg.samples;
+                        channels.set(msg.channelId, msg.samples);
+                        break;
+                        
+                    case 'setNoiseThreshold':
+                        noiseThreshold = msg.value;
+                        break;
+                        
+                    case 'setGain':
+                        gain = msg.value;
                         break;
                         
                     case 'processMix':
-                        if (processing) return;
+                        if (processing) {
+                            self.postMessage({ type: 'processed', samples: new Float32Array(BUFFER_SIZE), latency: 0 });
+                            return;
+                        }
                         processing = true;
                         
-                        // 简单的混音实现（无WASM时的降级方案）
-                        const channels = self.channels || {};
-                        const samples = new Float32Array(256);
-                        let activeCount = 0;
+                        const startTime = performance.now();
                         
-                        // 简单混音
-                        Object.values(channels).forEach(channel => {
-                            if (channel) {
-                                for (let i = 0; i < Math.min(channel.length, 256); i++) {
-                                    samples[i] += channel[i] * 0.5;
+                        // 收集活跃通道
+                        const activeChannels = [];
+                        channels.forEach((samples, id) => {
+                            if (samples && samples.length > 0) {
+                                const energy = computeEnergy(samples);
+                                if (energy > noiseThreshold * 0.5) {
+                                    activeChannels.push({ id, samples, energy });
                                 }
-                                activeCount++;
                             }
                         });
                         
-                        // 归一化
-                        if (activeCount > 1) {
-                            for (let i = 0; i < 256; i++) {
-                                samples[i] = Math.max(-1, Math.min(1, samples[i]));
+                        // 按能量排序
+                        activeChannels.sort((a, b) => b.energy - a.energy);
+                        
+                        // 混音
+                        const output = new Float32Array(BUFFER_SIZE);
+                        const maxMixChannels = 4;
+                        
+                        activeChannels.forEach((ch, idx) => {
+                            const vol = idx < maxMixChannels ? 1.0 : 0.3;
+                            for (let i = 0; i < Math.min(ch.samples.length, BUFFER_SIZE); i++) {
+                                output[i] += ch.samples[i] * vol;
                             }
+                        });
+                        
+                        // 噪声门和增益
+                        for (let i = 0; i < BUFFER_SIZE; i++) {
+                            if (Math.abs(output[i]) < noiseThreshold) {
+                                output[i] *= 0.1;
+                            }
+                            output[i] *= gain;
+                            output[i] = Math.max(-1, Math.min(1, output[i]));
                         }
                         
-                        self.postMessage({ type: 'processed', samples }, [samples.buffer]);
+                        const latency = performance.now() - startTime;
+                        
+                        self.postMessage(
+                            { type: 'processed', samples: output, latency, activeChannels: activeChannels.length },
+                            [output.buffer]
+                        );
                         processing = false;
                         break;
                         
                     case 'destroy':
+                        channels.clear();
                         self.close();
                         break;
                 }
             };
+            
+            function computeEnergy(samples) {
+                let energy = 0;
+                for (let i = 0; i < samples.length; i++) {
+                    energy += samples[i] * samples[i];
+                }
+                return Math.sqrt(energy / samples.length);
+            }
         `;
 
         const blob = new Blob([workerCode], { type: 'application/javascript' });
@@ -85,22 +133,11 @@ export class AudioProcessorManager {
             switch(response.type) {
                 case 'initialized':
                     this.initialized = true;
-                    if (this.onInitialized) {
-                        this.onInitialized();
-                    }
                     break;
                     
                 case 'processed':
-                    const callback = this.pendingRequests.get(this.requestId - 1);
-                    if (callback) {
-                        callback(response.samples);
-                        this.pendingRequests.delete(this.requestId - 1);
-                    }
-                    break;
-                    
-                case 'error':
-                    if (this.onError) {
-                        this.onError(response.message);
+                    if (this.onLatencyUpdate && response.latency !== undefined) {
+                        this.onLatencyUpdate(response.latency);
                     }
                     break;
             }
@@ -108,18 +145,17 @@ export class AudioProcessorManager {
 
         this.worker.onerror = (error) => {
             console.error('Audio worker error:', error);
-            if (this.onError) {
-                this.onError(error.message);
-            }
         };
 
-        // 初始化Worker
-        this.worker.postMessage({ type: 'init', maxChannels });
+        this.worker.postMessage({ type: 'init' });
 
         return new Promise((resolve) => {
-            this.onInitialized = () => {
-                resolve();
-            };
+            const checkInit = setInterval(() => {
+                if (this.initialized) {
+                    clearInterval(checkInit);
+                    resolve();
+                }
+            }, 10);
         });
     }
 
@@ -134,25 +170,47 @@ export class AudioProcessorManager {
 
     setNoiseThreshold(threshold: number): void {
         if (!this.worker || !this.initialized) return;
-        this.worker.postMessage({ type: 'setNoiseThreshold', threshold });
+        this.worker.postMessage({ type: 'setNoiseThreshold', value: threshold });
     }
 
     setGain(gain: number): void {
         if (!this.worker || !this.initialized) return;
-        this.worker.postMessage({ type: 'setGain', gain });
+        this.worker.postMessage({ type: 'setGain', value: gain });
     }
 
-    processMix(): Promise<Float32Array> {
+    processMix(): Promise<{ samples: Float32Array; latency: number }> {
         return new Promise((resolve) => {
             if (!this.worker || !this.initialized) {
-                resolve(new Float32Array(256));
+                resolve({ samples: new Float32Array(this.config.bufferSize), latency: 0 });
                 return;
             }
             
-            const id = this.requestId++;
-            this.pendingRequests.set(id, resolve);
+            const timeout = setTimeout(() => {
+                resolve({ samples: new Float32Array(this.config.bufferSize), latency: 999 });
+            }, 50);
+            
+            const handler = (e: MessageEvent) => {
+                if (e.data.type === 'processed') {
+                    clearTimeout(timeout);
+                    this.worker?.removeEventListener('message', handler);
+                    resolve({ 
+                        samples: e.data.samples, 
+                        latency: e.data.latency || 0 
+                    });
+                }
+            };
+            
+            this.worker.addEventListener('message', handler);
             this.worker.postMessage({ type: 'processMix' });
         });
+    }
+
+    onLatency(callback: (latency: number) => void): void {
+        this.onLatencyUpdate = callback;
+    }
+
+    getConfig(): AudioProcessorConfig {
+        return { ...this.config };
     }
 
     destroy(): void {
@@ -162,6 +220,25 @@ export class AudioProcessorManager {
             this.worker = null;
         }
         this.initialized = false;
-        this.pendingRequests.clear();
+    }
+}
+
+export function createLowLatencyAudioContext(): AudioContext | null {
+    try {
+        const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
+        
+        const audioContext = new AudioContext({
+            latencyHint: 'interactive',
+            sampleRate: 48000
+        });
+        
+        if (audioContext.state === 'suspended') {
+            audioContext.resume();
+        }
+        
+        return audioContext;
+    } catch (error) {
+        console.error('Failed to create low-latency AudioContext:', error);
+        return null;
     }
 }

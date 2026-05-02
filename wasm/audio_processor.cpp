@@ -4,10 +4,10 @@
 #include <algorithm>
 #include <cstring>
 
-// 配置参数
-#define MAX_MIX_CHANNELS 4  // 最多同时混音4路强信号
-#define ATTENUATED_GAIN 0.3f  // 其他路的衰减系数
-#define BUFFER_SIZE 256  // 优化后的缓冲区大小，更小的延迟
+// 低延迟配置
+#define BUFFER_SIZE 128  // 从256降至128，减少延迟
+#define MAX_MIX_CHANNELS 4
+#define ATTENUATED_GAIN 0.3f
 
 #if defined(__SSE__) || defined(__SSE2__)
 #include <xmmintrin.h>
@@ -18,70 +18,74 @@
 #define USE_NEON 1
 #endif
 
-class AudioProcessor {
+class LowLatencyAudioProcessor {
 private:
     struct ChannelState {
-        float* buffer;
-        int bufferSize;
+        float buffer[BUFFER_SIZE];
         float volume;
         float lastEnergy;
         bool active;
         
-        ChannelState() : buffer(nullptr), bufferSize(0), volume(1.0f), lastEnergy(0.0f), active(false) {}
+        ChannelState() : volume(1.0f), lastEnergy(0.0f), active(false) {
+            memset(buffer, 0, sizeof(buffer));
+        }
     };
 
-    std::vector<ChannelState> channels;
-    float* outputBuffer;
+    ChannelState channels[MAX_MIX_CHANNELS * 2];
+    float outputBuffer[BUFFER_SIZE];
     int maxChannels;
     float noiseThreshold;
     float gainMultiplier;
+    int activeChannelCount;
 
-    float computeEnergy(const float* samples, int length) {
-        float energy = 0.0f;
-        for (int i = 0; i < length; ++i) {
-            energy += samples[i] * samples[i];
-        }
-        return sqrt(energy / length);
+public:
+    LowLatencyAudioProcessor(int maxCh = 8) 
+        : maxChannels(maxCh), noiseThreshold(0.05f), gainMultiplier(1.0f), activeChannelCount(0) {
     }
 
-    void applyNoiseGate(float* samples, int length) {
-        for (int i = 0; i < length; ++i) {
-            if (fabs(samples[i]) < noiseThreshold) {
+    inline float computeEnergyFast(const float* samples) {
+        float energy = 0.0f;
+        for (int i = 0; i < BUFFER_SIZE; ++i) {
+            energy += samples[i] * samples[i];
+        }
+        return sqrtf(energy / BUFFER_SIZE);
+    }
+
+    inline void applyNoiseGate(float* samples) {
+        for (int i = 0; i < BUFFER_SIZE; ++i) {
+            float absVal = fabsf(samples[i]);
+            if (absVal < noiseThreshold) {
                 samples[i] *= 0.1f;
             }
         }
     }
 
-    void applyGain(float* samples, int length) {
-        for (int i = 0; i < length; ++i) {
+    inline void applyGainClipping(float* samples) {
+        for (int i = 0; i < BUFFER_SIZE; ++i) {
             samples[i] *= gainMultiplier;
-            // 削波保护
-            samples[i] = std::max(-1.0f, std::min(1.0f, samples[i]));
+            if (samples[i] > 1.0f) samples[i] = 1.0f;
+            else if (samples[i] < -1.0f) samples[i] = -1.0f;
         }
     }
 
-    // SIMD优化：SSE版本
 #ifdef USE_SSE
-    void mixChannelsSSE(float* output, const std::vector<int>& activeIndices, int length) {
-        int i = 0;
-        for (; i + 4 <= length; i += 4) {
+    inline void mixChannelsSSE(float* output, const std::vector<int>& indices) {
+        for (int i = 0; i + 4 <= BUFFER_SIZE; i += 4) {
             __m128 sum = _mm_setzero_ps();
             
-            for (int idx : activeIndices) {
+            for (int idx : indices) {
                 const float* buf = channels[idx].buffer;
                 float vol = channels[idx].volume;
-                __m128 vec = _mm_loadu_ps(&buf[i]);
-                __m128 v = _mm_mul_ps(vec, _mm_set1_ps(vol));
+                __m128 v = _mm_mul_ps(_mm_loadu_ps(&buf[i]), _mm_set1_ps(vol));
                 sum = _mm_add_ps(sum, v);
             }
             
             _mm_storeu_ps(&output[i], sum);
         }
         
-        // 处理剩余的样本
-        for (; i < length; ++i) {
+        for (int i = (BUFFER_SIZE & ~3); i < BUFFER_SIZE; ++i) {
             float sum = 0.0f;
-            for (int idx : activeIndices) {
+            for (int idx : indices) {
                 sum += channels[idx].buffer[i] * channels[idx].volume;
             }
             output[i] = sum;
@@ -89,27 +93,24 @@ private:
     }
 #endif
 
-    // SIMD优化：NEON版本
 #ifdef USE_NEON
-    void mixChannelsNEON(float* output, const std::vector<int>& activeIndices, int length) {
-        int i = 0;
-        for (; i + 4 <= length; i += 4) {
+    inline void mixChannelsNEON(float* output, const std::vector<int>& indices) {
+        for (int i = 0; i + 4 <= BUFFER_SIZE; i += 4) {
             float32x4_t sum = vdupq_n_f32(0.0f);
             
-            for (int idx : activeIndices) {
+            for (int idx : indices) {
                 const float* buf = channels[idx].buffer;
                 float vol = channels[idx].volume;
-                float32x4_t vec = vld1q_f32(&buf[i]);
-                float32x4_t v = vmulq_n_f32(vec, vol);
+                float32x4_t v = vmulq_n_f32(vld1q_f32(&buf[i]), vdupq_n_f32(vol));
                 sum = vaddq_f32(sum, v);
             }
             
             vst1q_f32(&output[i], sum);
         }
         
-        for (; i < length; ++i) {
+        for (int i = (BUFFER_SIZE & ~3); i < BUFFER_SIZE; ++i) {
             float sum = 0.0f;
-            for (int idx : activeIndices) {
+            for (int idx : indices) {
                 sum += channels[idx].buffer[i] * channels[idx].volume;
             }
             output[i] = sum;
@@ -117,62 +118,27 @@ private:
     }
 #endif
 
-    // 普通版本（无SIMD）
-    void mixChannelsScalar(float* output, const std::vector<int>& activeIndices, int length) {
-        memset(output, 0, length * sizeof(float));
-        for (int idx : activeIndices) {
+    inline void mixChannelsScalar(float* output, const std::vector<int>& indices) {
+        memset(output, 0, BUFFER_SIZE * sizeof(float));
+        for (int idx : indices) {
             float vol = channels[idx].volume;
             const float* buf = channels[idx].buffer;
-            for (int i = 0; i < length; ++i) {
+            for (int i = 0; i < BUFFER_SIZE; ++i) {
                 output[i] += buf[i] * vol;
             }
         }
     }
 
-public:
-    AudioProcessor(int maxCh = 8) : maxChannels(maxCh), noiseThreshold(0.05f), gainMultiplier(1.0f) {
-        channels.resize(maxChannels);
-        outputBuffer = new float[BUFFER_SIZE];
-        
-        for (auto& ch : channels) {
-            ch.buffer = new float[BUFFER_SIZE];
-            ch.bufferSize = BUFFER_SIZE;
-            memset(ch.buffer, 0, BUFFER_SIZE * sizeof(float));
-        }
-    }
-
-    ~AudioProcessor() {
-        delete[] outputBuffer;
-        for (auto& ch : channels) {
-            delete[] ch.buffer;
-        }
-    }
-
-    void setNoiseThreshold(float threshold) {
-        noiseThreshold = std::max(0.0f, std::min(1.0f, threshold));
-    }
-
-    void setGain(float gain) {
-        gainMultiplier = std::max(0.0f, std::min(5.0f, gain));
-    }
-
-    void setChannelData(int channelId, const float* samples, int length) {
+    inline void setChannelDataInternal(int channelId, const float* samples) {
         if (channelId < 0 || channelId >= maxChannels) return;
         
-        int copyLen = std::min(length, BUFFER_SIZE);
-        memcpy(channels[channelId].buffer, samples, copyLen * sizeof(float));
-        
-        if (copyLen < BUFFER_SIZE) {
-            memset(channels[channelId].buffer + copyLen, 0, (BUFFER_SIZE - copyLen) * sizeof(float));
-        }
-        
-        // 计算音量能量
-        channels[channelId].lastEnergy = computeEnergy(channels[channelId].buffer, BUFFER_SIZE);
-        channels[channelId].active = channels[channelId].lastEnergy > noiseThreshold * 0.5f;
+        ChannelState& ch = channels[channelId];
+        memcpy(ch.buffer, samples, BUFFER_SIZE * sizeof(float));
+        ch.lastEnergy = computeEnergyFast(ch.buffer);
+        ch.active = ch.lastEnergy > noiseThreshold * 0.5f;
     }
 
-    void processMix(float* output, int length) {
-        // 选择最强的MAX_MIX_CHANNELS路强信号
+    inline void processMixInternal() {
         std::vector<std::pair<float, int>> activeChannels;
         
         for (int i = 0; i < maxChannels; ++i) {
@@ -181,7 +147,6 @@ public:
             }
         }
         
-        // 按能量排序，选择前MAX_MIX_CHANNELS个
         std::sort(activeChannels.rbegin(), activeChannels.rend(),
                   [](const auto& a, const auto& b) { return a.first > b.first; });
         
@@ -195,73 +160,108 @@ public:
             selectedIndices.push_back(activeChannels[i].second);
         }
 
-        // 混音
-        int processLen = std::min(length, BUFFER_SIZE);
+        activeChannelCount = selectedIndices.size();
+
         if (selectedIndices.empty()) {
-            memset(output, 0, processLen * sizeof(float));
+            memset(outputBuffer, 0, BUFFER_SIZE * sizeof(float));
         } else {
 #ifdef USE_SSE
-            mixChannelsSSE(output, selectedIndices, processLen);
+            mixChannelsSSE(outputBuffer, selectedIndices);
 #elif USE_NEON
-            mixChannelsNEON(output, selectedIndices, processLen);
+            mixChannelsNEON(outputBuffer, selectedIndices);
 #else
-            mixChannelsScalar(output, selectedIndices, processLen);
+            mixChannelsScalar(outputBuffer, selectedIndices);
 #endif
         }
 
-        // 应用噪声门和增益
-        applyNoiseGate(output, processLen);
-        applyGain(output, processLen);
+        applyNoiseGate(outputBuffer);
+        applyGainClipping(outputBuffer);
+    }
+
+public:
+    void setNoiseThreshold(float threshold) {
+        noiseThreshold = std::max(0.0f, std::min(1.0f, threshold));
+    }
+
+    void setGain(float gain) {
+        gainMultiplier = std::max(0.0f, std::min(5.0f, gain));
+    }
+
+    void setChannelData(int channelId, const float* samples, int length) {
+        if (length != BUFFER_SIZE) {
+            static float tempBuffer[BUFFER_SIZE];
+            int copyLen = std::min(length, BUFFER_SIZE);
+            memcpy(tempBuffer, samples, copyLen * sizeof(float));
+            if (copyLen < BUFFER_SIZE) {
+                memset(tempBuffer + copyLen, 0, (BUFFER_SIZE - copyLen) * sizeof(float));
+            }
+            setChannelDataInternal(channelId, tempBuffer);
+        } else {
+            setChannelDataInternal(channelId, samples);
+        }
+    }
+
+    void processMix(float* output, int length) {
+        processMixInternal();
+        int copyLen = std::min(length, BUFFER_SIZE);
+        memcpy(output, outputBuffer, copyLen * sizeof(float));
+    }
+
+    const float* getOutput() const {
+        return outputBuffer;
     }
 
     int getBufferSize() const {
         return BUFFER_SIZE;
     }
+
+    int getActiveChannelCount() const {
+        return activeChannelCount;
+    }
 };
 
-// C API
 extern "C" {
 
 EMSCRIPTEN_KEEPALIVE
-AudioProcessor* createAudioProcessor(int maxChannels) {
-    return new AudioProcessor(maxChannels);
+LowLatencyAudioProcessor* createAudioProcessor(int maxChannels) {
+    return new LowLatencyAudioProcessor(maxChannels);
 }
 
 EMSCRIPTEN_KEEPALIVE
-void destroyAudioProcessor(AudioProcessor* processor) {
+void destroyAudioProcessor(LowLatencyAudioProcessor* processor) {
     delete processor;
 }
 
 EMSCRIPTEN_KEEPALIVE
-void setNoiseThreshold(AudioProcessor* processor, float threshold) {
+void setNoiseThreshold(LowLatencyAudioProcessor* processor, float threshold) {
     if (processor) {
         processor->setNoiseThreshold(threshold);
     }
 }
 
 EMSCRIPTEN_KEEPALIVE
-void setGain(AudioProcessor* processor, float gain) {
+void setGain(LowLatencyAudioProcessor* processor, float gain) {
     if (processor) {
         processor->setGain(gain);
     }
 }
 
 EMSCRIPTEN_KEEPALIVE
-void setChannelData(AudioProcessor* processor, int channelId, const float* samples, int length) {
+void setChannelData(LowLatencyAudioProcessor* processor, int channelId, const float* samples, int length) {
     if (processor) {
         processor->setChannelData(channelId, samples, length);
     }
 }
 
 EMSCRIPTEN_KEEPALIVE
-void processMix(AudioProcessor* processor, float* output, int length) {
+void processMix(LowLatencyAudioProcessor* processor, float* output, int length) {
     if (processor) {
         processor->processMix(output, length);
     }
 }
 
 EMSCRIPTEN_KEEPALIVE
-int getBufferSize(AudioProcessor* processor) {
+int getBufferSize(LowLatencyAudioProcessor* processor) {
     if (processor) {
         return processor->getBufferSize();
     }
@@ -269,13 +269,11 @@ int getBufferSize(AudioProcessor* processor) {
 }
 
 EMSCRIPTEN_KEEPALIVE
-float* allocateBuffer(int length) {
-    return new float[length];
-}
-
-EMSCRIPTEN_KEEPALIVE
-void freeBuffer(float* buffer) {
-    delete[] buffer;
+int getActiveChannelCount(LowLatencyAudioProcessor* processor) {
+    if (processor) {
+        return processor->getActiveChannelCount();
+    }
+    return 0;
 }
 
 }

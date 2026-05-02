@@ -4,7 +4,7 @@ import VideoCall from './components/VideoCall';
 import Chat from './components/Chat';
 import UserList from './components/UserList';
 import { User, DrawData, ChatMessage } from './types';
-import { AudioProcessorManager } from './utils/audioProcessorManager';
+import { LowLatencyAudioProcessorManager, createLowLatencyAudioContext } from './utils/audioProcessorManager';
 
 const App: React.FC = () => {
   const [ws, setWs] = useState<WebSocket | null>(null);
@@ -26,14 +26,16 @@ const App: React.FC = () => {
   const [noiseThreshold, setNoiseThreshold] = useState(0.05);
   const [gain, setGain] = useState(1.5);
   const [audioProcessorReady, setAudioProcessorReady] = useState(false);
+  const [audioLatency, setAudioLatency] = useState(0);
 
   const roomCodeInputRef = useRef<HTMLInputElement>(null);
   const peerConnections = useRef<Map<string, RTCPeerConnection>>(new Map());
   const mediaRecorder = useRef<MediaRecorder | null>(null);
   const recordedChunks = useRef<Blob[]>([]);
-  const audioProcessor = useRef<AudioProcessorManager | null>(null);
+  const audioProcessor = useRef<LowLatencyAudioProcessorManager | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
-  const audioBuffersRef = useRef<Map<string, Float32Array>>(new Map());
+  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
 
   const ICE_SERVERS = {
     iceServers: [
@@ -41,17 +43,26 @@ const App: React.FC = () => {
     ]
   };
 
-  // 初始化音频处理器
   useEffect(() => {
-    audioProcessor.current = new AudioProcessorManager();
+    audioProcessor.current = new LowLatencyAudioProcessorManager({
+      bufferSize: 128,
+      maxChannels: 8,
+      latencyHint: 'interactive',
+      noiseThreshold: noiseThreshold,
+      gain: gain
+    });
+    
+    audioProcessor.current.onLatency((latency) => {
+      setAudioLatency(latency);
+    });
     
     const initAudio = async () => {
       try {
-        await audioProcessor.current?.init(8);
+        await audioProcessor.current?.init();
         setAudioProcessorReady(true);
-        console.log('Audio processor initialized');
+        console.log('Low-latency audio processor initialized');
       } catch (error) {
-        console.warn('Audio processor not available, using fallback:', error);
+        console.warn('Audio processor not available:', error);
       }
     };
 
@@ -61,6 +72,7 @@ const App: React.FC = () => {
 
     return () => {
       audioProcessor.current?.destroy();
+      audioContextRef.current?.close();
     };
   }, [inRoom]);
 
@@ -153,11 +165,20 @@ const App: React.FC = () => {
 
   const initMedia = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        video: true, 
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
+          sampleRate: 48000,
+          latency: 0.01
+        }
+      });
       setLocalStream(stream);
       
-      // 设置音频处理
-      setupAudioProcessing(stream);
+      setupLowLatencyAudio(stream);
       
       users.forEach(user => {
         if (user.id !== userId) {
@@ -169,12 +190,42 @@ const App: React.FC = () => {
     }
   };
 
-  const setupAudioProcessing = (stream: MediaStream) => {
-    // 注意：在实际项目中，需要更完整的音频处理实现
-    // 这里只是设置音频参数
-    if (audioProcessor.current) {
-      audioProcessor.current.setNoiseThreshold(noiseThreshold);
-      audioProcessor.current.setGain(gain);
+  const setupLowLatencyAudio = (stream: MediaStream) => {
+    if (!audioProcessor.current) return;
+
+    audioContextRef.current = createLowLatencyAudioContext();
+    if (!audioContextRef.current) {
+      console.warn('Failed to create low-latency AudioContext');
+      return;
+    }
+
+    const ctx = audioContextRef.current;
+    
+    try {
+      sourceRef.current = ctx.createMediaStreamSource(stream);
+      
+      const bufferSize = 128;
+      processorRef.current = ctx.createScriptProcessor(bufferSize, 1, 1);
+      
+      processorRef.current.onaudioprocess = (event) => {
+        if (!audioProcessor.current || !isMicEnabled) return;
+        
+        const inputData = event.inputBuffer.getChannelData(0);
+        
+        audioProcessor.current.setChannelData(0, inputData);
+        
+        audioProcessor.current.processMix().then(({ samples, latency }) => {
+          const outputData = event.outputBuffer.getChannelData(0);
+          outputData.set(samples);
+        }).catch(() => {});
+      };
+      
+      sourceRef.current.connect(processorRef.current);
+      processorRef.current.connect(ctx.destination);
+      
+      console.log('Low-latency audio chain established');
+    } catch (error) {
+      console.error('Error setting up audio processing:', error);
     }
   };
 
@@ -265,6 +316,15 @@ const App: React.FC = () => {
   };
 
   const leaveRoom = () => {
+    if (processorRef.current) {
+      processorRef.current.disconnect();
+      processorRef.current = null;
+    }
+    if (sourceRef.current) {
+      sourceRef.current.disconnect();
+      sourceRef.current = null;
+    }
+    
     if (ws) {
       ws.send(JSON.stringify({ type: 'leaveRoom' }));
     }
@@ -654,7 +714,13 @@ const App: React.FC = () => {
           <span>{gain.toFixed(1)}</span>
         </div>
         <div style={{ marginLeft: 'auto', fontSize: '12px', color: '#7f8c8d' }}>
-          优化: SIMD加速 | 4路强信号混合 | 256采样缓冲区
+          <span style={{ 
+            color: audioLatency < 10 ? '#27ae60' : audioLatency < 50 ? '#f39c12' : '#e74c3c',
+            fontWeight: 'bold'
+          }}>
+            延迟: {audioLatency.toFixed(1)}ms
+          </span>
+          {' | '}128帧缓冲 | interactive模式
         </div>
       </div>
     </div>
