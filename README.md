@@ -55,8 +55,15 @@ npm install
 
 ```bash
 cd wasm
+
+# Linux/Mac
 ./build.sh
+
+# Windows
+build.bat
 ```
+
+**注意**: 如果不编译WASM模块，系统会自动使用降级方案（纯JavaScript实现）。
 
 ### 3. 启动服务
 
