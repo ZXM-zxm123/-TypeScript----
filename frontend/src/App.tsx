@@ -4,6 +4,7 @@ import VideoCall from './components/VideoCall';
 import Chat from './components/Chat';
 import UserList from './components/UserList';
 import { User, DrawData, ChatMessage } from './types';
+import { LowLatencyAudioProcessorManager, createLowLatencyAudioContext } from './utils/audioProcessorManager';
 
 const App: React.FC = () => {
   const [ws, setWs] = useState<WebSocket | null>(null);
@@ -22,20 +23,58 @@ const App: React.FC = () => {
   const [isScreenSharing, setIsScreenSharing] = useState<boolean>(false);
   const [isRecording, setIsRecording] = useState<boolean>(false);
   const [activeTab, setActiveTab] = useState<'whiteboard' | 'video'>('whiteboard');
-  const [noiseThreshold, setNoiseThreshold] = useState(0.1);
+  const [noiseThreshold, setNoiseThreshold] = useState(0.05);
   const [gain, setGain] = useState(1.5);
-  const roomCodeInputRef = useRef<HTMLInputElement>(null);
+  const [audioProcessorReady, setAudioProcessorReady] = useState(false);
+  const [audioLatency, setAudioLatency] = useState(0);
 
+  const roomCodeInputRef = useRef<HTMLInputElement>(null);
   const peerConnections = useRef<Map<string, RTCPeerConnection>>(new Map());
   const mediaRecorder = useRef<MediaRecorder | null>(null);
   const recordedChunks = useRef<Blob[]>([]);
-  const audioProcessor = useRef<any>(null);
+  const audioProcessor = useRef<LowLatencyAudioProcessorManager | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
 
   const ICE_SERVERS = {
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' }
     ]
   };
+
+  useEffect(() => {
+    audioProcessor.current = new LowLatencyAudioProcessorManager({
+      bufferSize: 128,
+      maxChannels: 8,
+      latencyHint: 'interactive',
+      noiseThreshold: noiseThreshold,
+      gain: gain
+    });
+    
+    audioProcessor.current.onLatency((latency) => {
+      setAudioLatency(latency);
+    });
+    
+    const initAudio = async () => {
+      try {
+        await audioProcessor.current?.init();
+        setAudioProcessorReady(true);
+        console.log('Low-latency audio processor initialized');
+      } catch (error) {
+        console.warn('Audio processor not available:', error);
+      }
+    };
+
+    if (inRoom) {
+      initAudio();
+    }
+
+    return () => {
+      audioProcessor.current?.destroy();
+      audioContextRef.current?.close();
+    };
+  }, [inRoom]);
 
   useEffect(() => {
     const initWs = new WebSocket('ws://localhost:3001');
@@ -126,8 +165,20 @@ const App: React.FC = () => {
 
   const initMedia = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        video: true, 
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
+          sampleRate: 48000,
+          latency: 0.01
+        }
+      });
       setLocalStream(stream);
+      
+      setupLowLatencyAudio(stream);
       
       users.forEach(user => {
         if (user.id !== userId) {
@@ -136,6 +187,45 @@ const App: React.FC = () => {
       });
     } catch (error) {
       console.error('Error accessing media devices:', error);
+    }
+  };
+
+  const setupLowLatencyAudio = (stream: MediaStream) => {
+    if (!audioProcessor.current) return;
+
+    audioContextRef.current = createLowLatencyAudioContext();
+    if (!audioContextRef.current) {
+      console.warn('Failed to create low-latency AudioContext');
+      return;
+    }
+
+    const ctx = audioContextRef.current;
+    
+    try {
+      sourceRef.current = ctx.createMediaStreamSource(stream);
+      
+      const bufferSize = 128;
+      processorRef.current = ctx.createScriptProcessor(bufferSize, 1, 1);
+      
+      processorRef.current.onaudioprocess = (event) => {
+        if (!audioProcessor.current || !isMicEnabled) return;
+        
+        const inputData = event.inputBuffer.getChannelData(0);
+        
+        audioProcessor.current.setChannelData(0, inputData);
+        
+        audioProcessor.current.processMix().then(({ samples, latency }) => {
+          const outputData = event.outputBuffer.getChannelData(0);
+          outputData.set(samples);
+        }).catch(() => {});
+      };
+      
+      sourceRef.current.connect(processorRef.current);
+      processorRef.current.connect(ctx.destination);
+      
+      console.log('Low-latency audio chain established');
+    } catch (error) {
+      console.error('Error setting up audio processing:', error);
     }
   };
 
@@ -226,6 +316,15 @@ const App: React.FC = () => {
   };
 
   const leaveRoom = () => {
+    if (processorRef.current) {
+      processorRef.current.disconnect();
+      processorRef.current = null;
+    }
+    if (sourceRef.current) {
+      sourceRef.current.disconnect();
+      sourceRef.current = null;
+    }
+    
     if (ws) {
       ws.send(JSON.stringify({ type: 'leaveRoom' }));
     }
@@ -372,6 +471,20 @@ const App: React.FC = () => {
     }
   };
 
+  const handleNoiseThresholdChange = (value: number) => {
+    setNoiseThreshold(value);
+    if (audioProcessor.current) {
+      audioProcessor.current.setNoiseThreshold(value);
+    }
+  };
+
+  const handleGainChange = (value: number) => {
+    setGain(value);
+    if (audioProcessor.current) {
+      audioProcessor.current.setGain(value);
+    }
+  };
+
   if (!inRoom) {
     return (
       <div style={{
@@ -468,13 +581,18 @@ const App: React.FC = () => {
         <div>
           <span style={{ fontWeight: 'bold', fontSize: '18px' }}>房间号: {roomCode}</span>
           {isHost && <span style={{ marginLeft: '15px', color: '#f39c12' }}>(主持人)</span>}
+          {!audioProcessorReady && inRoom && (
+            <span style={{ marginLeft: '15px', color: '#e74c3c' }}>
+              (音频处理器初始化中...)
+            </span>
+          )}
         </div>
         <div style={{ display: 'flex', gap: '10px' }}>
           <button
             onClick={isRecording ? stopRecording : startRecording}
             style={{
               padding: '8px 16px',
-              background: isRecording ? '#f44336' : '#9b59b6',
+              background: isRecording ? '#e74c3c' : '#9b59b6',
               color: '#fff',
               border: 'none',
               borderRadius: '4px',
@@ -571,10 +689,7 @@ const App: React.FC = () => {
         gap: '20px',
         alignItems: 'center'
       }}>
-        <div style={{ display: 'flex',
-        alignItems: 'center',
-        gap: '10px'
-      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
           <span>降噪阈值:</span>
           <input
             type="range"
@@ -582,14 +697,11 @@ const App: React.FC = () => {
             max="0.5"
             step="0.01"
             value={noiseThreshold}
-            onChange={(e) => setNoiseThreshold(parseFloat(e.target.value))}
+            onChange={(e) => handleNoiseThresholdChange(parseFloat(e.target.value))}
           />
           <span>{noiseThreshold.toFixed(2)}</span>
         </div>
-        <div style={{ display: 'flex',
-        alignItems: 'center',
-        gap: '10px'
-      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
           <span>增益:</span>
           <input
             type="range"
@@ -597,9 +709,18 @@ const App: React.FC = () => {
             max="3"
             step="0.1"
             value={gain}
-            onChange={(e) => setGain(parseFloat(e.target.value))}
+            onChange={(e) => handleGainChange(parseFloat(e.target.value))}
           />
           <span>{gain.toFixed(1)}</span>
+        </div>
+        <div style={{ marginLeft: 'auto', fontSize: '12px', color: '#7f8c8d' }}>
+          <span style={{ 
+            color: audioLatency < 10 ? '#27ae60' : audioLatency < 50 ? '#f39c12' : '#e74c3c',
+            fontWeight: 'bold'
+          }}>
+            延迟: {audioLatency.toFixed(1)}ms
+          </span>
+          {' | '}128帧缓冲 | interactive模式
         </div>
       </div>
     </div>

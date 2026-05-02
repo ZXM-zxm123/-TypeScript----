@@ -22,6 +22,7 @@
 - **用户列表**: 显示房间内所有用户，支持主持人踢出用户
 - **房间管理**: 创建/加入房间，自动生成房间码
 - **权限控制**: 主持人可以踢出用户，主持人权限自动转移
+- **低延迟音频**: 128帧缓冲，Web Worker处理，单向延迟<100ms
 
 ### 后端 (Node.js)
 - **WebSocket信令服务器**: 处理WebRTC连接建立
@@ -32,6 +33,11 @@
 ### WebAssembly (C++)
 - **音频处理**: 噪声抑制
 - **增益控制**: 自动音量调节
+- **多路混音**: 智能混音，支持最多8路音频
+- **SIMD优化**: 使用SSE/NEON指令加速
+- **低延迟**: 128帧缓冲，Web Worker异步处理，单向延迟<100ms
+- **性能优化**: 见 [PERFORMANCE_OPTIMIZATION.md](PERFORMANCE_OPTIMIZATION.md)
+- **延迟优化**: 见 [LATENCY_OPTIMIZATION.md](LATENCY_OPTIMIZATION.md)
 
 ## 快速开始
 
@@ -55,8 +61,15 @@ npm install
 
 ```bash
 cd wasm
+
+# Linux/Mac
 ./build.sh
+
+# Windows
+build.bat
 ```
+
+**注意**: 如果不编译WASM模块，系统会自动使用降级方案（纯JavaScript实现）。
 
 ### 3. 启动服务
 
@@ -112,6 +125,7 @@ npm start
 - 使用底部的滑块调节：
   - 降噪阈值: 调节噪声抑制强度
   - 增益: 调节音量
+- 实时延迟显示（目标<100ms）
 
 ### 主持人权限
 - 创建房间的用户默认为主持人
@@ -125,6 +139,7 @@ npm start
 - TypeScript
 - WebRTC API
 - Canvas API
+- Web Worker
 
 ### 后端
 - Node.js
@@ -135,6 +150,7 @@ npm start
 ### WebAssembly
 - C++
 - Emscripten
+- SIMD指令集
 
 ## 注意事项
 
@@ -142,6 +158,7 @@ npm start
 2. WebRTC需要在可信网络环境中使用
 3. 录制功能需要浏览器支持MediaRecorder API
 4. WebAssembly音频处理需要先编译wasm模块
+5. 音频延迟优化默认启用，状态栏显示实时延迟
 
 ## 开发
 
@@ -163,6 +180,18 @@ npm start
 cd wasm
 ./build.sh
 ```
+
+## 性能优化
+
+### 音频延迟优化
+- **缓冲区**: 128帧（从512降至128）
+- **处理模式**: Web Worker异步处理
+- **AudioContext**: interactive低延迟模式
+- **目标延迟**: 单向<100ms
+
+详细优化说明见：
+- [LATENCY_OPTIMIZATION.md](LATENCY_OPTIMIZATION.md) - 延迟优化详解
+- [PERFORMANCE_OPTIMIZATION.md](PERFORMANCE_OPTIMIZATION.md) - 性能优化详解
 
 ## 许可证
 
